@@ -220,22 +220,29 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 }
 
 // pollPayment polls Mollie until the payment reaches a terminal status.
-// It uses exponential backoff (2s → 4s → 8s, capped at 10s) for poll intervals
-// and sends an intermediate status to the ECR every 5 s when enabled.
+// It uses a two-phase poll interval: every 2 s for the first 16 s, then
+// every 5 s until the context is cancelled (timeout).
+// An intermediate status is sent to the ECR every 5 s when enabled.
 func (d *Dispatcher) pollPayment(ctx context.Context, session *Session, initial *mollie.PaymentResult) (*mollie.PaymentResult, byte) {
+	const (
+		fastInterval  = 2 * time.Second
+		slowInterval  = 5 * time.Second
+		fastPhaseEnd  = 16 * time.Second
+	)
+
 	payment := initial
 	if mollie.IsTerminalStatus(payment.Status) {
 		return payment, statusToResultCode(payment.Status)
 	}
 
-	backoff := 2 * time.Second
+	start := time.Now()
 	var intermediateCh <-chan time.Time
 	if session.intermediateOK {
 		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		intermediateCh = t.C
 	}
-	pollTimer := time.NewTimer(backoff)
+	pollTimer := time.NewTimer(fastInterval)
 	defer pollTimer.Stop()
 
 	for {
@@ -250,18 +257,20 @@ func (d *Dispatcher) pollPayment(ctx context.Context, session *Session, initial 
 
 		case <-pollTimer.C:
 			p, err := d.mollie.GetPayment(ctx, payment.ID)
+			interval := fastInterval
+			if time.Since(start) >= fastPhaseEnd {
+				interval = slowInterval
+			}
 			if err != nil {
 				slog.Warn("authorization: GetPayment transient error, retrying", "err", err)
-				backoff = min(backoff*2, 10*time.Second)
-				pollTimer.Reset(backoff)
+				pollTimer.Reset(interval)
 				continue
 			}
 			payment = p
 			if mollie.IsTerminalStatus(payment.Status) {
 				return payment, statusToResultCode(payment.Status)
 			}
-			backoff = min(backoff*2, 10*time.Second)
-			pollTimer.Reset(backoff)
+			pollTimer.Reset(interval)
 		}
 	}
 }
