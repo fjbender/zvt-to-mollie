@@ -28,7 +28,7 @@ const (
 // ZVT result codes returned to the ECR (ZVT spec chapter 10).
 const (
 	ResultSuccess        byte = 0x00
-	ResultCardError      byte = 0x62 // card not readable / method not supported
+	ResultCardError      byte = 0x62 // card not readable / payment declined by issuer
 	ResultCommError      byte = 0x63 // communication error with Mollie API
 	ResultNotFound       byte = 0x64 // transaction not found
 	ResultCanceled       byte = 0x6A // transaction cancelled

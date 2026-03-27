@@ -107,7 +107,7 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 	bmps, err := DecodeBMP(apdu.Data)
 	if err != nil {
 		slog.Error("authorization: failed to decode BMPs", "err", err)
-		d.writeStatusAndCompletion(session, ResultCommError, nil)
+		d.writeStatusAndAbort(session, ResultCommError, nil)
 		session.state = stateIdle
 		return nil, nil
 	}
@@ -149,7 +149,7 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 	payment, err := d.mollie.CreatePayment(pollCtx, amountCents, currency, description, idempotencyKey)
 	if err != nil {
 		slog.Error("authorization: CreatePayment failed", "err", err)
-		d.writeStatusAndCompletion(session, ResultCommError, nil)
+		d.writeStatusAndAbort(session, ResultCommError, nil)
 		session.state = stateIdle
 		return nil, nil
 	}
@@ -203,11 +203,16 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 		}
 	}
 
-	// Step 10: Send Completion.
-	completionFrame := buildCompletion()
-	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(completionFrame))
-	if _, err := session.conn.Write(completionFrame); err != nil {
-		slog.Error("authorization: failed to write Completion", "err", err)
+	// Step 10: Send Completion on success, Abort on failure (spec §2.2.9).
+	var finalFrame []byte
+	if resultCode == ResultSuccess {
+		finalFrame = buildCompletion()
+	} else {
+		finalFrame = buildAbort(resultCode)
+	}
+	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(finalFrame))
+	if _, err := session.conn.Write(finalFrame); err != nil {
+		slog.Error("authorization: failed to write Completion/Abort", "err", err)
 	}
 
 	session.state = stateIdle
@@ -267,7 +272,7 @@ func statusToResultCode(status string) byte {
 	case "paid":
 		return ResultSuccess
 	case "failed":
-		return ResultCommError
+		return ResultCardError
 	case "canceled":
 		return ResultCanceled
 	case "expired":
@@ -277,19 +282,24 @@ func statusToResultCode(status string) byte {
 	}
 }
 
-// writeStatusAndCompletion sends a Status-Info APDU followed by a Completion APDU to the ECR.
-// It is used for both success and error paths.
-func (d *Dispatcher) writeStatusAndCompletion(session *Session, result byte, bmps []BMP) {
+// writeStatusAndAbort sends a Status-Info APDU followed by a Completion or Abort APDU
+// to the ECR, depending on the result code (spec §2.2.9).
+func (d *Dispatcher) writeStatusAndAbort(session *Session, result byte, bmps []BMP) {
 	statusFrame := buildStatusInfo(result, bmps)
 	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(statusFrame))
 	if _, err := session.conn.Write(statusFrame); err != nil {
 		slog.Error("zvt: failed to write Status-Info", "err", err)
 		return
 	}
-	completionFrame := buildCompletion()
-	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(completionFrame))
-	if _, err := session.conn.Write(completionFrame); err != nil {
-		slog.Error("zvt: failed to write Completion", "err", err)
+	var finalFrame []byte
+	if result == ResultSuccess {
+		finalFrame = buildCompletion()
+	} else {
+		finalFrame = buildAbort(result)
+	}
+	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(finalFrame))
+	if _, err := session.conn.Write(finalFrame); err != nil {
+		slog.Error("zvt: failed to write Completion/Abort", "err", err)
 	}
 }
 
@@ -310,6 +320,12 @@ func buildStatusInfo(result byte, bmps []BMP) []byte {
 // buildCompletion returns a Completion APDU (06 0F 00).
 func buildCompletion() []byte {
 	return []byte{ClassPayment, InstrCompletion, 0x00}
+}
+
+// buildAbort returns an Abort APDU (06 1E 01 <result-code>) as required by
+// spec §2.2.9 when the transaction and/or issue of goods failed.
+func buildAbort(resultCode byte) []byte {
+	return []byte{ClassPayment, InstrAbortPT, 0x01, resultCode}
 }
 
 // buildIntermediateStatus returns an Intermediate Status APDU (04 FF 01 <status>).

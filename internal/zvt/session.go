@@ -52,6 +52,12 @@ func (s *Session) Run(ctx context.Context) {
 			slog.Debug("zvt recv", "remote", s.conn.RemoteAddr(), "hex", hex.EncodeToString(raw))
 		}
 
+		// Silently discard ACK frames (80-00-00); some ECRs send an ACK after
+		// Completion even though the spec does not require it.
+		if len(apdu.ControlField) >= 1 && apdu.ControlField[0] == ClassACK {
+			continue
+		}
+
 		// While a transaction is in-flight, only Abort is accepted; all other
 		// commands receive FrameUnknown and are ignored.
 		if s.state == stateInTransaction {
