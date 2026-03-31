@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/fjbender/zvt-to-mollie/internal/mollie"
@@ -19,6 +20,7 @@ type Dispatcher struct {
 	store        *store.Store
 	password     uint64 // ZVT terminal password as a BCD-decoded integer (e.g. "000000" → 0)
 	currencyCode uint64 // ZVT numeric currency code (e.g. 978 for EUR)
+	txCounter    atomic.Uint64 // monotonic counter; source for PT-generated trace and receipt numbers
 }
 
 // NewDispatcher creates a Dispatcher wired to the given Mollie client and state store.
@@ -114,7 +116,7 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 
 	var amountCents int64
 	currencyCode := d.currencyCode
-	var traceNumber uint64
+	var ecrTraceNumber uint64
 
 	if amtData, ok := FindBMP(bmps, BMPAmount); ok && len(amtData) == 6 {
 		var b [6]byte
@@ -124,18 +126,25 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 	if currData, ok := FindBMP(bmps, BMPCurrency); ok {
 		currencyCode = DecodeBCD(currData)
 	}
-	traceFound := false
+	// BMP 0B is not part of the spec's 06 01 ECR→PT data block; accept it only
+	// as a vendor extension and use it solely as a Mollie idempotency key.
 	if traceData, ok := FindBMP(bmps, BMPTrace); ok {
-		traceNumber = DecodeBCD(traceData)
-		traceFound = true
+		ecrTraceNumber = DecodeBCD(traceData)
 	}
+
+	// Assign PT-generated transaction identifiers from the monotonic counter.
+	// Receipt number (BMP 87): 4 decimal digits (mod 10000).
+	// Trace number  (BMP 0B): 6 decimal digits (mod 1000000).
+	seq := d.txCounter.Add(1)
+	ptTraceNumber := seq % 1_000_000
+	receiptNo := uint16(seq % 10_000)
 
 	currency := CurrencyCodeToISO(currencyCode)
 	var idempotencyKey string
-	if traceFound {
-		idempotencyKey = fmt.Sprintf("zvt-trace-%d", traceNumber)
+	if ecrTraceNumber != 0 {
+		idempotencyKey = fmt.Sprintf("zvt-trace-%d", ecrTraceNumber)
 	}
-	description := fmt.Sprintf("ZVT Payment trace=%d", traceNumber)
+	description := fmt.Sprintf("ZVT Payment receipt=%d trace=%d", receiptNo, ptTraceNumber)
 
 	// Step 3: Create a cancellable context for the in-flight Mollie calls.
 	pollCtx, cancel := context.WithCancel(ctx)
@@ -161,13 +170,12 @@ func (d *Dispatcher) handleAuthorization(ctx context.Context, apdu *APDU, sessio
 	payment, resultCode := d.pollPayment(pollCtx, session, payment)
 
 	// Step 6: Build Status-Info BMPs.
-	receiptNo := uint16(traceNumber % 10000)
 	now := time.Now()
 	timeVal := uint64(now.Hour())*10000 + uint64(now.Minute())*100 + uint64(now.Second())
 	dateVal := uint64(now.Month())*100 + uint64(now.Day())
 
 	extraBMPs := []BMP{
-		{Tag: BMPTrace, Data: EncodeBCD(traceNumber, 3)},
+		{Tag: BMPTrace, Data: EncodeBCD(ptTraceNumber, 3)},
 		{Tag: BMPTime, Data: EncodeBCD(timeVal, 3)},
 		{Tag: BMPDate, Data: EncodeBCD(dateVal, 2)},
 		{Tag: BMPCurrency, Data: EncodeBCD(currencyCode, 2)},

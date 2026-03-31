@@ -61,7 +61,25 @@ Health and readiness probes are available at `GET /healthz` and `GET /readyz` on
 
 **Registration (`06 00`)** validates the 6-digit password, parses the config byte (intermediate status enable flag), validates an optional currency code (BMP 49), and returns ACK or a PT-initiated abort with result code `6F` on currency mismatch.
 
-**Authorization (`06 01`)** parses amount (BMP 04), currency (BMP 49), and trace number (BMP 0B), creates a Mollie `pointofsale` payment, polls for completion with exponential backoff (2 s → 4 s → 8 s, capped at 10 s), sends intermediate status frames (04 FF) every 5 s when enabled, and returns a Status-Info frame (04 0F) followed by Completion (06 0F). The Mollie API call uses the trace number as an idempotency key. The receipt-to-payment-ID mapping is persisted in BoltDB.
+**Authorization (`06 01`)** parses amount (BMP 04) and optional currency (BMP 49). Per spec §2.2.1 the ECR does **not** include a trace number in the `06 01` request; BMP `0B` is absent from the defined data block. The implementation accepts BMP `0B` if an ECR sends it as a vendor extension and uses it as a Mollie idempotency key when present. The PT assigns a receipt number (BMP `87`) which is returned in the Status-Info frame — this is the authoritative link between the ECR's checkout and the PT's payment (see _Transaction correlation_ below). The implementation polls Mollie with exponential backoff (2 s → 4 s → 8 s, capped at 10 s), sends intermediate status frames (04 FF) every 5 s when enabled, and returns a Status-Info frame (04 0F) followed by Completion (06 0F). The receipt-to-payment-ID mapping is persisted in BoltDB, keyed on BMP `87`.
+
+## Transaction correlation
+
+ZVT assigns different identifiers to the two sides of a payment:
+
+| Field | Tag | Owner | Meaning |
+|---|---|---|---|
+| Receipt number | BMP `87` | **PT-generated** | Primary cross-domain key. PT assigns it, returns it in Status-Info (`04 0F`), ECR stores it and sends it back in Reversal (`06 30`) / Refund (`06 31`). |
+| Trace number | BMP `0B` | **PT-generated** | PT-internal counter echoed in Status-Info. Also returned in End-of-Day (`06 50`) reconciliation. |
+| Orig. trace | BMP `37` | PT (in Reversal Status-Info) | Trace number of the original payment being reversed. |
+
+The flow per spec §2.2 and §2.9:
+
+1. **ECR → PT** `06 01`: amount, optional currency/payment-type. No receipt or trace number.
+2. **PT → ECR** `04 0F` (Status-Info): PT sends BMP `87` (receipt number) and BMP `0B` (trace). The ECR records the receipt number against its local checkout.
+3. **ECR → PT** `06 30` (Reversal): ECR sends BMP `87` to identify the original transaction. The PT looks it up in its turnover storage.
+
+BMP `0B` is **not** part of the `06 01` ECR→PT request in the spec. Some ECR implementations send it as a vendor extension; when present this service accepts it and uses it as a Mollie idempotency key. Regardless, the receipt number (BMP `87`) is always PT-generated and is the canonical link between an ECR checkout and a Mollie payment.
 
 ## Roadmap
 
