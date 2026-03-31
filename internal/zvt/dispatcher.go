@@ -61,6 +61,11 @@ func (d *Dispatcher) Dispatch(ctx context.Context, apdu *APDU, session *Session)
 //	[0..2]  password    3 bytes BCD (6 decimal digits)
 //	[3]     config byte bit 0x08 → intermediate status enabled
 //	[4..]   optional BMPs (e.g. BMP 49 currency code)
+//
+// Sequence (spec §2.1):
+//  1. PT → ECR: ACK (80 00 00)
+//  2. PT → ECR: Completion (06 0F) with status-byte
+//  3. ECR → PT: ACK (80 00 00)
 func (d *Dispatcher) handleRegistration(apdu *APDU, session *Session) ([]byte, error) {
 	data := apdu.Data
 	if len(data) < 4 {
@@ -89,7 +94,26 @@ func (d *Dispatcher) handleRegistration(apdu *APDU, session *Session) ([]byte, e
 		}
 	}
 
-	return FrameACK, nil
+	// Step 1: Send ACK.
+	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(FrameACK))
+	if _, err := session.conn.Write(FrameACK); err != nil {
+		return nil, err
+	}
+
+	// Step 2: Send Completion (06 0F) with status-byte 0x00 (no issues).
+	completion := buildRegistrationCompletion()
+	slog.Debug("zvt send", "remote", session.conn.RemoteAddr(), "hex", hex.EncodeToString(completion))
+	if _, err := session.conn.Write(completion); err != nil {
+		return nil, err
+	}
+
+	// Step 3: Wait for ECR ACK (80 00 00).
+	ackBuf := make([]byte, 3)
+	if _, err := io.ReadFull(session.conn, ackBuf); err != nil {
+		slog.Error("registration: failed to read ECR ACK", "err", err)
+	}
+
+	return nil, nil
 }
 
 // handleAuthorization processes an Authorization command (06 01).
@@ -337,6 +361,12 @@ func buildStatusInfo(result byte, bmps []BMP) []byte {
 // buildCompletion returns a Completion APDU (06 0F 00).
 func buildCompletion() []byte {
 	return []byte{ClassPayment, InstrCompletion, 0x00}
+}
+
+// buildRegistrationCompletion returns the Completion APDU (06 0F) for the Registration
+// sequence (spec §2.1). It includes BMP 19 (status-byte = 0x00: no issues).
+func buildRegistrationCompletion() []byte {
+	return []byte{ClassPayment, InstrCompletion, 0x02, 0x19, 0x00}
 }
 
 // buildAbort returns an Abort APDU (06 1E 01 <result-code>) as required by

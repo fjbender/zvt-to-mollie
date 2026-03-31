@@ -58,17 +58,59 @@ func registrationAPDU(password [3]byte, configByte byte, extraBMPs []byte) []byt
 	return append(frame, data...)
 }
 
+// dispatchRegistration drives the full Registration sequence over the pipe:
+// it sends the APDU to Dispatch in a goroutine, then on the peer side reads
+// the ACK + Completion and writes back the ECR ACK, mirroring spec §2.1.
+func dispatchRegistration(t *testing.T, d *Dispatcher, s *Session, peer net.Conn, raw []byte) {
+	t.Helper()
+	apdu, err := ParseAPDU(raw)
+	if err != nil {
+		t.Fatalf("ParseAPDU: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := d.Dispatch(context.Background(), apdu, s)
+		done <- err
+	}()
+
+	// Read PT ACK (80 00 00).
+	ack := make([]byte, 3)
+	if _, err := peer.Read(ack); err != nil {
+		t.Fatalf("reading ACK: %v", err)
+	}
+	if string(ack) != string(FrameACK) {
+		t.Errorf("expected ACK %x from PT, got %x", FrameACK, ack)
+	}
+
+	// Read PT Completion (06 0F 02 19 00).
+	completion := make([]byte, 5)
+	if _, err := peer.Read(completion); err != nil {
+		t.Fatalf("reading Completion: %v", err)
+	}
+	wantCompletion := buildRegistrationCompletion()
+	if string(completion) != string(wantCompletion) {
+		t.Errorf("expected Completion %x from PT, got %x", wantCompletion, completion)
+	}
+
+	// Send ECR ACK back to PT.
+	if _, err := peer.Write(FrameACK); err != nil {
+		t.Fatalf("writing ECR ACK: %v", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("Dispatch returned error: %v", err)
+	}
+}
+
 func TestRegistration_HappyPath(t *testing.T) {
 	d := newTestDispatcher("000000", "978")
 	s, peer := newTestSession(d)
 	defer peer.Close()
 
 	raw := registrationAPDU([3]byte{0x00, 0x00, 0x00}, 0x00, nil)
-	resp := dispatch(t, d, s, raw)
+	dispatchRegistration(t, d, s, peer, raw)
 
-	if string(resp) != string(FrameACK) {
-		t.Errorf("expected FrameACK %x, got %x", FrameACK, resp)
-	}
 	if s.intermediateOK {
 		t.Error("intermediateOK should be false when config byte 0x08 is not set")
 	}
@@ -80,11 +122,8 @@ func TestRegistration_IntermediateOK(t *testing.T) {
 	defer peer.Close()
 
 	raw := registrationAPDU([3]byte{0x00, 0x00, 0x00}, 0x08, nil)
-	resp := dispatch(t, d, s, raw)
+	dispatchRegistration(t, d, s, peer, raw)
 
-	if string(resp) != string(FrameACK) {
-		t.Errorf("expected FrameACK %x, got %x", FrameACK, resp)
-	}
 	if !s.intermediateOK {
 		t.Error("intermediateOK should be true when config byte bit 0x08 is set")
 	}
@@ -128,11 +167,7 @@ func TestRegistration_CorrectCurrencyBMP(t *testing.T) {
 	// BMP 49 with EUR (978 = 0x09 0x78).
 	bmp49 := []byte{BMPCurrency, 0x09, 0x78}
 	raw := registrationAPDU([3]byte{0x00, 0x00, 0x00}, 0x00, bmp49)
-	resp := dispatch(t, d, s, raw)
-
-	if string(resp) != string(FrameACK) {
-		t.Errorf("expected FrameACK %x, got %x", FrameACK, resp)
-	}
+	dispatchRegistration(t, d, s, peer, raw)
 }
 
 func TestRegistration_TooShort(t *testing.T) {
