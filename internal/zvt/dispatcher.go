@@ -49,6 +49,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, apdu *APDU, session *Session)
 		return d.handleRegistration(apdu, session)
 	case class == ClassPayment && instr == InstrAuthorization:
 		return d.handleAuthorization(ctx, apdu, session)
+	case class == ClassPayment && instr == InstrLogOff:
+		return d.handleLogOff(session)
 	default:
 		return FrameUnknown, nil
 	}
@@ -114,6 +116,19 @@ func (d *Dispatcher) handleRegistration(apdu *APDU, session *Session) ([]byte, e
 	}
 
 	return nil, nil
+}
+
+// handleLogOff processes a Log-Off command (06 02).
+//
+// Sequence (spec §2.25):
+//  1. PT resets the Registration config-byte to 0x86 (intermediate status disabled).
+//  2. PT → ECR: ACK (80 00 00).
+//  3. Connection is closed.
+func (d *Dispatcher) handleLogOff(session *Session) ([]byte, error) {
+	// Reset config-byte to 0x86: bit 0x08 is not set, so intermediate status is disabled.
+	session.intermediateOK = false
+	session.state = stateClose
+	return FrameACK, nil
 }
 
 // handleAuthorization processes an Authorization command (06 01).

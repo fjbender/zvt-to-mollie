@@ -170,6 +170,30 @@ func TestRegistration_CorrectCurrencyBMP(t *testing.T) {
 	dispatchRegistration(t, d, s, peer, raw)
 }
 
+// --- Log-Off (06 02) ---
+
+func TestLogOff_HappyPath(t *testing.T) {
+	d := newTestDispatcher("000000", "978")
+	s, peer := newTestSession(d)
+	defer peer.Close()
+
+	// Enable intermediate status first so we can verify it is reset.
+	s.intermediateOK = true
+
+	raw := []byte{ClassPayment, InstrLogOff, 0x00}
+	resp := dispatch(t, d, s, raw)
+
+	if string(resp) != string(FrameACK) {
+		t.Errorf("expected ACK %x, got %x", FrameACK, resp)
+	}
+	if s.state != stateClose {
+		t.Error("expected state to be stateClose after Log-Off")
+	}
+	if s.intermediateOK {
+		t.Error("expected intermediateOK to be reset to false after Log-Off")
+	}
+}
+
 func TestRegistration_TooShort(t *testing.T) {
 	d := newTestDispatcher("000000", "978")
 	s, peer := newTestSession(d)
